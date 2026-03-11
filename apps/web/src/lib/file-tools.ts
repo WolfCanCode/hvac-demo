@@ -281,29 +281,34 @@ export async function extractLegendFromFile(file: File, projectId: string): Prom
 }
 
 function cropLegendPreview(sourceCanvas: HTMLCanvasElement, baseViewportHeight: number, renderScale: number, row: LegendRow): string | undefined {
-  const cropWidth = Math.max(128, Math.min(220, (row.maxX - row.minX) * renderScale + 90));
-  const cropHeight = Math.max(104, (row.maxY - row.minY) * renderScale + 56);
-  const targetX = Math.max(0, row.minX * renderScale - cropWidth + 18);
+  // Search a wider zone around the expected symbol position, then trim down to
+  // the actual ink. This is more reliable than anchoring the crop directly to
+  // the row text because some searchable PDFs place the symbol code text inside
+  // the symbol and shift the text bounds into the icon itself.
+  const searchWidth = Math.round(132 * renderScale);
+  const searchHeight = Math.round(110 * renderScale);
+  const symbolLead = Math.round(98 * renderScale);
+  const targetX = Math.max(0, row.minX * renderScale - symbolLead);
   const centerY = ((row.minY + row.maxY) / 2) * renderScale;
-  const targetY = Math.max(0, baseViewportHeight * renderScale - centerY - cropHeight / 2);
-  const clampedWidth = Math.min(cropWidth, sourceCanvas.width - targetX);
-  const clampedHeight = Math.min(cropHeight, sourceCanvas.height - targetY);
+  const targetY = Math.max(0, baseViewportHeight * renderScale - centerY - searchHeight / 2);
+  const clampedWidth = Math.min(searchWidth, sourceCanvas.width - targetX);
+  const clampedHeight = Math.min(searchHeight, sourceCanvas.height - targetY);
 
   if (clampedWidth <= 0 || clampedHeight <= 0) {
     return undefined;
   }
 
-  const cropCanvas = document.createElement("canvas");
-  cropCanvas.width = Math.round(clampedWidth);
-  cropCanvas.height = Math.round(clampedHeight);
-  const cropContext = cropCanvas.getContext("2d");
-  if (!cropContext) {
+  const searchCanvas = document.createElement("canvas");
+  searchCanvas.width = Math.round(clampedWidth);
+  searchCanvas.height = Math.round(clampedHeight);
+  const searchContext = searchCanvas.getContext("2d");
+  if (!searchContext) {
     return undefined;
   }
 
-  cropContext.fillStyle = "#ffffff";
-  cropContext.fillRect(0, 0, cropCanvas.width, cropCanvas.height);
-  cropContext.drawImage(
+  searchContext.fillStyle = "#ffffff";
+  searchContext.fillRect(0, 0, searchCanvas.width, searchCanvas.height);
+  searchContext.drawImage(
     sourceCanvas,
     targetX,
     targetY,
@@ -311,9 +316,34 @@ function cropLegendPreview(sourceCanvas: HTMLCanvasElement, baseViewportHeight: 
     clampedHeight,
     0,
     0,
-    cropCanvas.width,
-    cropCanvas.height
+    searchCanvas.width,
+    searchCanvas.height
   );
+
+  const bounds = findInkBounds(searchCanvas, {
+    ignoreRight: Math.min(Math.round(18 * renderScale), Math.max(0, searchCanvas.width - Math.round(24 * renderScale)))
+  });
+
+  if (!bounds) {
+    return squarePreview(searchCanvas)?.toDataURL("image/png");
+  }
+
+  const padding = Math.round(8 * renderScale);
+  const trimX = Math.max(0, bounds.minX - padding);
+  const trimY = Math.max(0, bounds.minY - padding);
+  const trimWidth = Math.min(searchCanvas.width - trimX, bounds.maxX - bounds.minX + padding * 2);
+  const trimHeight = Math.min(searchCanvas.height - trimY, bounds.maxY - bounds.minY + padding * 2);
+  const cropCanvas = document.createElement("canvas");
+  cropCanvas.width = trimWidth;
+  cropCanvas.height = trimHeight;
+  const cropContext = cropCanvas.getContext("2d");
+  if (!cropContext) {
+    return undefined;
+  }
+
+  cropContext.fillStyle = "#ffffff";
+  cropContext.fillRect(0, 0, trimWidth, trimHeight);
+  cropContext.drawImage(searchCanvas, trimX, trimY, trimWidth, trimHeight, 0, 0, trimWidth, trimHeight);
 
   return squarePreview(trimPreviewWhitespace(cropCanvas) ?? cropCanvas)?.toDataURL("image/png");
 }
@@ -324,43 +354,16 @@ function trimPreviewWhitespace(sourceCanvas: HTMLCanvasElement): HTMLCanvasEleme
     return undefined;
   }
 
-  const { width, height } = sourceCanvas;
-  const imageData = context.getImageData(0, 0, width, height);
-  const { data } = imageData;
-  let minX = width;
-  let minY = height;
-  let maxX = -1;
-  let maxY = -1;
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const offset = (y * width + x) * 4;
-      const red = data[offset];
-      const green = data[offset + 1];
-      const blue = data[offset + 2];
-      const alpha = data[offset + 3];
-
-      const isVisibleInk = alpha > 0 && (red < 245 || green < 245 || blue < 245);
-      if (!isVisibleInk) {
-        continue;
-      }
-
-      minX = Math.min(minX, x);
-      minY = Math.min(minY, y);
-      maxX = Math.max(maxX, x);
-      maxY = Math.max(maxY, y);
-    }
-  }
-
-  if (maxX < minX || maxY < minY) {
+  const bounds = findInkBounds(sourceCanvas);
+  if (!bounds) {
     return sourceCanvas;
   }
 
   const padding = 10;
-  const trimX = Math.max(0, minX - padding);
-  const trimY = Math.max(0, minY - padding);
-  const trimWidth = Math.min(width - trimX, maxX - minX + padding * 2);
-  const trimHeight = Math.min(height - trimY, maxY - minY + padding * 2);
+  const trimX = Math.max(0, bounds.minX - padding);
+  const trimY = Math.max(0, bounds.minY - padding);
+  const trimWidth = Math.min(sourceCanvas.width - trimX, bounds.maxX - bounds.minX + padding * 2);
+  const trimHeight = Math.min(sourceCanvas.height - trimY, bounds.maxY - bounds.minY + padding * 2);
   const trimmed = document.createElement("canvas");
   trimmed.width = trimWidth;
   trimmed.height = trimHeight;
@@ -384,6 +387,62 @@ function trimPreviewWhitespace(sourceCanvas: HTMLCanvasElement): HTMLCanvasEleme
   );
 
   return trimmed;
+}
+
+function findInkBounds(
+  sourceCanvas: HTMLCanvasElement,
+  options?: {
+    ignoreLeft?: number;
+    ignoreRight?: number;
+    ignoreTop?: number;
+    ignoreBottom?: number;
+  }
+): { minX: number; minY: number; maxX: number; maxY: number } | undefined {
+  const context = sourceCanvas.getContext("2d");
+  if (!context) {
+    return undefined;
+  }
+
+  const { width, height } = sourceCanvas;
+  const ignoreLeft = Math.max(0, options?.ignoreLeft ?? 0);
+  const ignoreRight = Math.max(0, options?.ignoreRight ?? 0);
+  const ignoreTop = Math.max(0, options?.ignoreTop ?? 0);
+  const ignoreBottom = Math.max(0, options?.ignoreBottom ?? 0);
+  const startX = Math.min(width, ignoreLeft);
+  const endX = Math.max(startX, width - ignoreRight);
+  const startY = Math.min(height, ignoreTop);
+  const endY = Math.max(startY, height - ignoreBottom);
+  const imageData = context.getImageData(0, 0, width, height);
+  const { data } = imageData;
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = startY; y < endY; y += 1) {
+    for (let x = startX; x < endX; x += 1) {
+      const offset = (y * width + x) * 4;
+      const red = data[offset];
+      const green = data[offset + 1];
+      const blue = data[offset + 2];
+      const alpha = data[offset + 3];
+      const isVisibleInk = alpha > 0 && (red < 245 || green < 245 || blue < 245);
+      if (!isVisibleInk) {
+        continue;
+      }
+
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return undefined;
+  }
+
+  return { minX, minY, maxX, maxY };
 }
 
 function squarePreview(sourceCanvas: HTMLCanvasElement): HTMLCanvasElement | undefined {
