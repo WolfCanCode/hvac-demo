@@ -894,20 +894,6 @@ function LegendStep({
         <button className="cta-button" onClick={() => onChange([...symbols, blankLegend()])} type="button">
           ADD SYMBOL
         </button>
-        <button
-          className="cta-button danger"
-          onClick={() => {
-            if (symbols.length === 0) {
-              return;
-            }
-            if (window.confirm("Clear all recognized symbols?")) {
-              onChange([]);
-            }
-          }}
-          type="button"
-        >
-          CLEAR ALL
-        </button>
         <button className="cta-button green" onClick={onSave} type="button">
           SAVE LEGEND
         </button>
@@ -1153,7 +1139,7 @@ function AiProgressStep({
   const safeSessions = Array.isArray(sessions) ? sessions : [];
   const displayed = benchmark.reviewedRows > 0 ? benchmark : progress;
   return (
-    <div className="page-stack">
+    <div className="page-stack ai-progress-page">
       <div className="summary-row">
         <StatCard accent="mint" label="GLOBAL ACCURACY" value={`${displayed.currentAccuracy}%`} />
         <StatCard accent="lavender" label="TRAINING SESSIONS" value={`${displayed.learningSessions}`} />
@@ -1164,26 +1150,53 @@ function AiProgressStep({
       <div className="progress-grid">
         <ProgressChart sessions={safeSessions} />
         <aside className="focus-card">
-          <h3>GLOBAL AI BENCHMARK</h3>
-          <ul>
-            <li>{benchmark.contributors} contributing account(s)</li>
-            <li>{displayed.reviewedRows} reviewed training samples</li>
-            <li>{benchmark.totalCorrections} total corrections learned</li>
-          </ul>
-          <div className="mini-list">
-            {drawingItems.slice(0, 3).map((item) => (
-              <div className="mini-row" key={item.id}>
-                <span>{item.description}</span>
-                <strong>{item.verificationStatus}</strong>
-              </div>
-            ))}
+          <div className="focus-card-head">
+            <div>
+              <p className="focus-kicker">SHARED INTELLIGENCE</p>
+              <h3>Global AI Benchmark</h3>
+              <p className="focus-copy">This benchmark reflects all submitted training sessions across accounts.</p>
+            </div>
+          </div>
+
+          <div className="focus-metrics">
+            <div className="focus-metric">
+              <span>Contributors</span>
+              <strong>{benchmark.contributors}</strong>
+            </div>
+            <div className="focus-metric">
+              <span>Reviewed samples</span>
+              <strong>{displayed.reviewedRows}</strong>
+            </div>
+            <div className="focus-metric">
+              <span>Corrections learned</span>
+              <strong>{benchmark.totalCorrections}</strong>
+            </div>
+          </div>
+
+          <div className="mini-list-card">
+            <div className="mini-list-header">
+              <span>Recent reviewed rows</span>
+              <strong>{Math.min(drawingItems.length, 3)} shown</strong>
+            </div>
+            <div className="mini-list">
+              {drawingItems.slice(0, 3).map((item) => (
+                <div className="mini-row" key={item.id}>
+                  <span>{item.description}</span>
+                  <strong>{item.verificationStatus}</strong>
+                </div>
+              ))}
+              {drawingItems.length === 0 ? <div className="mini-empty">No reviewed rows in this local workspace yet.</div> : null}
+            </div>
           </div>
         </aside>
       </div>
 
-      <section className="table-card">
+      <section className="table-card training-table-card">
         <div className="table-card-header">
-          <div className="table-heading">TRAINING SESSIONS</div>
+          <div>
+            <div className="table-heading">TRAINING SESSIONS</div>
+            <p className="table-subcopy">Every feedback submission updates the shared benchmark for all signed-in users.</p>
+          </div>
           <div className="chip-row">
             <span className="filter-chip active">GLOBAL</span>
             <span className="filter-chip">{safeSessions.length} SESSIONS</span>
@@ -1267,6 +1280,7 @@ function DrawingTable({
 
 function PredictionBadge({ item }: { item: DrawingMtoItem }) {
   const source = item.predictionSource ?? "heuristic";
+  const confidence = Math.round(item.confidence * 100);
   const label =
     source === "learned_exact_tag"
       ? "LEARNED TAG"
@@ -1275,9 +1289,14 @@ function PredictionBadge({ item }: { item: DrawingMtoItem }) {
         : "HEURISTIC";
 
   return (
-    <div className="prediction-cell" title={item.predictionDetail || undefined}>
-      <span className={`prediction-chip ${source}`}>{label}</span>
-      <span className="prediction-confidence">{Math.round(item.confidence * 100)}%</span>
+    <div className={`prediction-cell ${source}`} title={item.predictionDetail || undefined}>
+      <div className="prediction-meta">
+        <span className={`prediction-chip ${source}`}>{label}</span>
+        <span className="prediction-score">{confidence}%</span>
+      </div>
+      <div className="prediction-meter" aria-hidden="true">
+        <span className="prediction-meter-fill" style={{ width: `${confidence}%` }} />
+      </div>
     </div>
   );
 }

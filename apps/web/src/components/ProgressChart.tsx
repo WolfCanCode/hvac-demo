@@ -19,7 +19,10 @@ export function ProgressChart({ sessions }: ProgressChartProps) {
     return (
       <div className="chart-shell">
         <div className="chart-header">
-          <h3>AI Learning Momentum</h3>
+          <div>
+            <p className="chart-kicker">SHARED LEARNING TREND</p>
+            <h3>AI Learning Momentum</h3>
+          </div>
           <span>No training sessions yet</span>
         </div>
         <div className="chart-empty">
@@ -31,6 +34,10 @@ export function ProgressChart({ sessions }: ProgressChartProps) {
   }
 
   const stepX = visibleSessions.length === 1 ? 0 : CHART_WIDTH / (visibleSessions.length - 1);
+  const latestSession = visibleSessions[visibleSessions.length - 1];
+  const averageAccuracy = Math.round(
+    visibleSessions.reduce((sum, session) => sum + session.currentAccuracy, 0) / visibleSessions.length
+  );
   const points = visibleSessions.map((session, index) => ({
     ...session,
     x: index * stepX,
@@ -42,8 +49,24 @@ export function ProgressChart({ sessions }: ProgressChartProps) {
   return (
     <div className="chart-shell">
       <div className="chart-header">
-        <h3>AI Learning Momentum</h3>
+        <div>
+          <p className="chart-kicker">SHARED LEARNING TREND</p>
+          <h3>AI Learning Momentum</h3>
+        </div>
         <span>Last {visibleSessions.length} training sessions</span>
+      </div>
+
+      <div className="chart-summary-strip">
+        <div className="chart-summary-card">
+          <small>LATEST SESSION</small>
+          <strong>{latestSession.currentAccuracy}%</strong>
+          <span>{(latestSession.email || "unknown").split("@")[0]}</span>
+        </div>
+        <div className="chart-summary-card">
+          <small>AVERAGE ACCURACY</small>
+          <strong>{averageAccuracy}%</strong>
+          <span>Across {visibleSessions.length} recent sessions</span>
+        </div>
       </div>
 
       <div className="chart-grid">
@@ -100,7 +123,11 @@ export function ProgressChart({ sessions }: ProgressChartProps) {
 
           <div className="chart-x-axis">
             {visibleSessions.map((session, index) => (
-              <div className="chart-x-tick" key={session.id} style={{ left: `${(index / Math.max(1, visibleSessions.length - 1)) * 100}%` }}>
+              <div
+                className="chart-x-tick"
+                key={session.id}
+                style={{ left: `${(index / Math.max(1, visibleSessions.length - 1)) * 100}%` }}
+              >
                 <strong>S{index + 1}</strong>
                 <span>{(session.email || "unknown").split("@")[0]}</span>
               </div>

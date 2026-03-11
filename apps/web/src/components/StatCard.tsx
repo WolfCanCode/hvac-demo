@@ -7,7 +7,6 @@ interface StatCardProps {
 export function StatCard({ label, value, accent }: StatCardProps) {
   return (
     <article className={`stat-card ${accent}`}>
-      <div className="stat-icon" />
       <span>{label}</span>
       <strong>{value}</strong>
     </article>
