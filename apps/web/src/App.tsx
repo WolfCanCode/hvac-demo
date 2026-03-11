@@ -744,8 +744,6 @@ export default function App() {
           <div className="workspace-inner">
             {error ? <div className="notice error">{error}</div> : null}
 
-            {authLoading ? <div className="auth-loading">Checking your Google session...</div> : null}
-
             {!authLoading && !sessionUser ? (
               <AuthGate googleClientId={googleClientId} googleButtonRef={googleButtonRef} />
             ) : null}

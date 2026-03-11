@@ -329,15 +329,6 @@ button {
   padding-top: 16px;
 }
 
-.auth-loading {
-  margin-top: 24px;
-  min-height: 320px;
-  display: grid;
-  place-items: center;
-  color: #767b92;
-  font-size: 15px;
-}
-
 .auth-gate {
   min-height: calc(100vh - 220px);
   display: grid;
@@ -1410,7 +1401,22 @@ td {
 }
 
 .training-table-card .table-card-header {
+  padding: 0;
   align-items: flex-start;
+}
+
+.training-table-card .table-card-header > div:first-child {
+  padding: 16px 18px;
+}
+
+.training-table-card .chip-row {
+  padding: 16px 18px;
+}
+
+.training-table-card th,
+.training-table-card td {
+  padding-top: 12px;
+  padding-bottom: 12px;
 }
 
 .training-table-card table tbody tr:nth-child(odd) td {
