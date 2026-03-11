@@ -1,0 +1,25 @@
+{
+  "name": "@hvac/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev src/index.ts --local",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "deploy": "wrangler deploy",
+    "d1:migrate": "wrangler d1 migrations apply hvac_ai_engineer --local",
+    "d1:migrate:remote": "wrangler d1 migrations apply hvac_ai_engineer"
+  },
+  "dependencies": {
+    "@hvac/shared": "0.1.0",
+    "hono": "^4.7.2",
+    "jose": "^6.0.12",
+    "xlsx": "^0.18.5",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250321.0",
+    "wrangler": "^4.8.0"
+  }
+}

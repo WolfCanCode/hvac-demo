@@ -1,0 +1,26 @@
+{
+  "name": "hvac-ai-engineer",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace apps/web run dev",
+    "dev:api": "npm --workspace apps/api run dev",
+    "build": "npm --workspace packages/shared run build && npm run build:web && npm run build:api",
+    "build:web": "npm --workspace apps/web run build",
+    "build:api": "npm --workspace apps/api run build",
+    "deploy:web": "npm --workspace apps/web run deploy",
+    "deploy:api": "npm --workspace apps/api run deploy",
+    "typecheck": "npm --workspace packages/shared run build && npm --workspace apps/api run typecheck && npm --workspace apps/web run typecheck",
+    "test": "npm --workspace packages/shared run build && vitest run",
+    "postinstall": "npm --workspace packages/shared run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.2",
+    "vitest": "^3.1.1"
+  }
+}

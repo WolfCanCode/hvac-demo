@@ -1,0 +1,28 @@
+{
+  "name": "@hvac/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "deploy": "npm run build && wrangler pages deploy dist --project-name hvac-ai-engineer-web"
+  },
+  "dependencies": {
+    "@hvac/shared": "0.1.0",
+    "lucide-react": "^0.511.0",
+    "pdfjs-dist": "^4.10.38",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tesseract.js": "^6.0.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.4.1",
+    "vite": "^7.3.1",
+    "wrangler": "^4.72.0"
+  }
+}

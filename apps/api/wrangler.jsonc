@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hvac-ai-engineer-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-11",
+  "vars": {
+    "APP_ORIGIN": "https://hvac-ai-engineer-web.pages.dev",
+    "GOOGLE_CLIENT_ID": "890676547124-302d697n0esg78ud37lehv00bv8eui8b.apps.googleusercontent.com",
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hvac_ai_engineer",
+      "database_id": "93186f30-dc26-44df-947a-39ca0825471e",
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "hvac-ai-engineer-files",
+    },
+  ],
+}
