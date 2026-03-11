@@ -49,7 +49,7 @@ app.use(
   "/api/*",
   cors({
     origin: (origin, c) => origin ?? c.env.APP_ORIGIN,
-    allowHeaders: ["Content-Type"],
+    allowHeaders: ["Content-Type", "Authorization"],
     allowMethods: ["GET", "POST", "PUT", "OPTIONS"],
     credentials: true
   })
@@ -57,7 +57,9 @@ app.use(
 
 app.use("/api/*", async (c, next) => {
   await ensureAuthSchema(c.env.DB);
-  const token = getCookie(c, SESSION_COOKIE);
+  const authorization = c.req.header("authorization");
+  const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : null;
+  const token = bearerToken || getCookie(c, SESSION_COOKIE);
   if (!token) {
     c.set("sessionUser", null);
     await next();
@@ -732,7 +734,7 @@ app.post("/api/auth/google", async (c) => {
   const sessionToken = await signSessionToken(user, c.env);
   setSessionCookie(c, sessionToken);
   const projectBundle = await getCurrentProjectBundle(c.env.DB, user.id);
-  return c.json({ user, projectBundle });
+  return c.json({ user, projectBundle, sessionToken });
 });
 
 app.get("/api/auth/me", async (c) => {

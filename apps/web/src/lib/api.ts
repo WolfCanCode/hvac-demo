@@ -15,6 +15,7 @@ const API_URL =
   (typeof window !== "undefined"
     ? `${window.location.protocol}//${window.location.hostname}:8787`
     : "http://localhost:8787");
+const SESSION_TOKEN_KEY = "hvac-session-token";
 
 export class ApiError extends Error {
   status: number;
@@ -26,14 +27,27 @@ export class ApiError extends Error {
   }
 }
 
+function getSessionToken() {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  return window.localStorage.getItem(SESSION_TOKEN_KEY) ?? "";
+}
+
+function buildHeaders(init?: RequestInit) {
+  const token = getSessionToken();
+  return {
+    ...(init?.body ? { "Content-Type": "application/json" } : {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(init?.headers ?? {})
+  };
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
     credentials: "include",
-    headers: {
-      ...(init?.body ? { "Content-Type": "application/json" } : {}),
-      ...(init?.headers ?? {})
-    }
+    headers: buildHeaders(init)
   });
 
   if (!response.ok) {
@@ -52,12 +66,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export function storeSessionToken(token: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (token) {
+    window.localStorage.setItem(SESSION_TOKEN_KEY, token);
+  } else {
+    window.localStorage.removeItem(SESSION_TOKEN_KEY);
+  }
+}
+
 export function getAuthSession() {
   return request<AuthSession>("/api/auth/me");
 }
 
 export function signInWithGoogle(credential: string) {
-  return request<AuthSession & { projectBundle: ProjectBundle }>("/api/auth/google", {
+  return request<AuthSession & { projectBundle: ProjectBundle; sessionToken: string }>("/api/auth/google", {
     method: "POST",
     body: JSON.stringify({ credential })
   });
@@ -97,13 +122,23 @@ export async function uploadFile(signature: UploadSignature, file: File) {
     method: "PUT",
     credentials: "include",
     headers: {
+      ...buildHeaders(),
       "Content-Type": file.type || "application/octet-stream"
     },
     body: file
   });
 
   if (!response.ok) {
-    throw new Error("Upload failed");
+    let message = `Upload failed: ${response.status}`;
+    try {
+      const payload = (await response.json()) as { message?: string };
+      if (payload.message) {
+        message = payload.message;
+      }
+    } catch {
+      // Ignore non-JSON failures.
+    }
+    throw new ApiError(message, response.status);
   }
 }
 
@@ -170,5 +205,31 @@ export function submitFeedback(
 }
 
 export function downloadExport(projectId: string) {
-  window.open(`${API_URL}/api/projects/${projectId}/export.xlsx`, "_blank");
+  return fetch(`${API_URL}/api/projects/${projectId}/export.xlsx`, {
+    credentials: "include",
+    headers: buildHeaders()
+  }).then(async (response) => {
+    if (!response.ok) {
+      let message = `Export failed: ${response.status}`;
+      try {
+        const payload = (await response.json()) as { message?: string };
+        if (payload.message) {
+          message = payload.message;
+        }
+      } catch {
+        // Ignore non-JSON failures.
+      }
+      throw new ApiError(message, response.status);
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `reconciliation-${projectId}.xlsx`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  });
 }

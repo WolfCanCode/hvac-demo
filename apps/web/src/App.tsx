@@ -23,6 +23,7 @@ import {
   saveLegend,
   signUpload,
   signInWithGoogle,
+  storeSessionToken,
   submitFeedback,
   uploadFile
 } from "./lib/api";
@@ -62,6 +63,11 @@ const AUTH_CREDENTIAL_KEY = "hvac-google-credential";
 const USER_SNAPSHOT_KEY = "hvac-session-user";
 const PROJECT_CACHE_KEY = "hvac-project-cache";
 
+type ToastState = {
+  tone: "success" | "error";
+  message: string;
+} | null;
+
 function readJson<T>(key: string): T | null {
   const raw = window.localStorage.getItem(key);
   if (!raw) {
@@ -78,6 +84,7 @@ function readJson<T>(key: string): T | null {
 
 export default function App() {
   const googleButtonRef = useRef<HTMLDivElement | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
   const [activeStep, setActiveStep] = useState(0);
   const [projectId, setProjectId] = useState("");
   const [projectName, setProjectName] = useState("HVAC AI Engineer MTO");
@@ -91,7 +98,39 @@ export default function App() {
   const [progress, setProgress] = useState<AiProgressSnapshot>(emptyProgress());
   const [busyLabel, setBusyLabel] = useState("");
   const [error, setError] = useState("");
+  const [toast, setToast] = useState<ToastState>(null);
   const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID ?? "";
+
+  function clearToastTimer() {
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+  }
+
+  function showToast(tone: "success" | "error", message: string) {
+    clearToastTimer();
+    setToast({ tone, message });
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast(null);
+      toastTimerRef.current = null;
+    }, 3200);
+  }
+
+  function describeError(caught: unknown, fallback: string) {
+    if (caught instanceof ApiError) {
+      if (caught.status === 401) {
+        return "Your session expired. Sign in again.";
+      }
+      if (caught.message) {
+        return caught.message;
+      }
+    }
+    if (caught instanceof Error && caught.message) {
+      return caught.message;
+    }
+    return fallback;
+  }
 
   function persistSessionUser(user: UserProfile | null) {
     if (user) {
@@ -139,11 +178,49 @@ export default function App() {
     if (clearStoredAuth) {
       window.localStorage.removeItem(AUTH_CREDENTIAL_KEY);
       persistSessionUser(null);
+      storeSessionToken("");
     }
   }
 
   function isUnauthorized(errorValue: unknown) {
     return errorValue instanceof ApiError && errorValue.status === 401;
+  }
+
+  async function runTask<T>(
+    label: string,
+    task: () => Promise<T>,
+    options?: {
+      successMessage?: string;
+      fallbackError?: string;
+      clearError?: boolean;
+    }
+  ) {
+    setBusyLabel(label);
+    if (options?.clearError) {
+      setError("");
+    }
+    try {
+      const result = await task();
+      if (options?.successMessage) {
+        showToast("success", options.successMessage);
+      }
+      return result;
+    } catch (caught) {
+      if (isUnauthorized(caught)) {
+        setSessionUser(null);
+        resetWorkspace(true);
+        setError("Your session expired. Sign in again.");
+        showToast("error", "Your session expired. Sign in again.");
+        return null;
+      }
+
+      const message = describeError(caught, options?.fallbackError ?? "Something went wrong.");
+      setError(message);
+      showToast("error", message);
+      return null;
+    } finally {
+      setBusyLabel("");
+    }
   }
 
   async function loadWorkspace() {
@@ -178,6 +255,7 @@ export default function App() {
         if (cachedCredential) {
           setBusyLabel("Restoring session");
           const restored = await signInWithGoogle(cachedCredential);
+          storeSessionToken(restored.sessionToken);
           setSessionUser(restored.user);
           persistSessionUser(restored.user);
           if (restored.user) {
@@ -185,7 +263,8 @@ export default function App() {
           }
         }
       } catch (caught) {
-        setError(caught instanceof Error ? caught.message : "Failed to initialize project");
+        const message = describeError(caught, "Failed to initialize project");
+        setError(message);
       } finally {
         setAuthLoading(false);
         setBusyLabel("");
@@ -196,20 +275,28 @@ export default function App() {
   }, []);
 
   async function handleGoogleAuth(credential: string) {
-    try {
-      setError("");
-      setBusyLabel("Signing in with Google");
-      const session = await signInWithGoogle(credential);
-      window.localStorage.setItem(AUTH_CREDENTIAL_KEY, credential);
-      setSessionUser(session.user);
-      persistSessionUser(session.user);
-      setAvatarFailed(false);
-      applyBundle(session.projectBundle);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Google sign-in failed");
-    } finally {
-      setBusyLabel("");
+    const session = await runTask(
+      "Signing in with Google",
+      async () => {
+        setError("");
+        return signInWithGoogle(credential);
+      },
+      {
+        fallbackError: "Google sign-in failed"
+      }
+    );
+
+    if (!session) {
+      return;
     }
+
+    window.localStorage.setItem(AUTH_CREDENTIAL_KEY, credential);
+    storeSessionToken(session.sessionToken);
+    setSessionUser(session.user);
+    persistSessionUser(session.user);
+    setAvatarFailed(false);
+    applyBundle(session.projectBundle);
+    showToast("success", `Signed in as ${session.user?.name ?? "Google user"}.`);
   }
 
   useEffect(() => {
@@ -288,23 +375,22 @@ export default function App() {
     if (!projectId) {
       return;
     }
-    setBusyLabel("Scanning legend");
-    setError("");
-    try {
-      await persistFile("legend", file);
-      const symbols = await extractLegendFromFile(file, projectId);
-      setLegendSymbols(symbols);
-      setActiveStep(0);
-    } catch (caught) {
-      if (isUnauthorized(caught)) {
-        setSessionUser(null);
-        resetWorkspace(true);
-        setError("Your session expired. Sign in again.");
-        return;
+    const ok = await runTask(
+      "Scanning legend",
+      async () => {
+        await persistFile("legend", file);
+        const symbols = await extractLegendFromFile(file, projectId);
+        setLegendSymbols(symbols);
+        setActiveStep(0);
+      },
+      {
+        successMessage: `Legend extracted from ${file.name}.`,
+        fallbackError: "Legend extraction failed",
+        clearError: true
       }
-      setError(caught instanceof Error ? caught.message : "Legend extraction failed");
-    } finally {
-      setBusyLabel("");
+    );
+    if (!ok) {
+      return;
     }
   }
 
@@ -312,23 +398,22 @@ export default function App() {
     if (!projectId) {
       return;
     }
-    setBusyLabel("Analyzing drawing MTO");
-    setError("");
-    try {
-      await persistFile("drawing", file);
-      const items = await extractDrawingItemsFromFile(file, projectId, legendSymbols);
-      setDrawingItems(items);
-      setActiveStep(1);
-    } catch (caught) {
-      if (isUnauthorized(caught)) {
-        setSessionUser(null);
-        resetWorkspace(true);
-        setError("Your session expired. Sign in again.");
-        return;
+    const ok = await runTask(
+      "Analyzing drawing MTO",
+      async () => {
+        await persistFile("drawing", file);
+        const items = await extractDrawingItemsFromFile(file, projectId, legendSymbols);
+        setDrawingItems(items);
+        setActiveStep(1);
+      },
+      {
+        successMessage: `Drawing analysis completed for ${file.name}.`,
+        fallbackError: "Drawing extraction failed",
+        clearError: true
       }
-      setError(caught instanceof Error ? caught.message : "Drawing extraction failed");
-    } finally {
-      setBusyLabel("");
+    );
+    if (!ok) {
+      return;
     }
   }
 
@@ -336,24 +421,23 @@ export default function App() {
     if (!projectId) {
       return;
     }
-    setBusyLabel("Parsing model MTO");
-    setError("");
-    try {
-      await persistFile("model", file);
-      const items = await parseSpreadsheet(file, projectId);
-      const bundle = await importModelItems(projectId, file.name, items);
-      applyBundle(bundle);
-      setActiveStep(2);
-    } catch (caught) {
-      if (isUnauthorized(caught)) {
-        setSessionUser(null);
-        resetWorkspace(true);
-        setError("Your session expired. Sign in again.");
-        return;
+    const ok = await runTask(
+      "Parsing model MTO",
+      async () => {
+        await persistFile("model", file);
+        const items = await parseSpreadsheet(file, projectId);
+        const bundle = await importModelItems(projectId, file.name, items);
+        applyBundle(bundle);
+        setActiveStep(2);
+      },
+      {
+        successMessage: `Model data imported from ${file.name}.`,
+        fallbackError: "Model import failed",
+        clearError: true
       }
-      setError(caught instanceof Error ? caught.message : "Model import failed");
-    } finally {
-      setBusyLabel("");
+    );
+    if (!ok) {
+      return;
     }
   }
 
@@ -361,94 +445,100 @@ export default function App() {
     if (!projectId) {
       return;
     }
-    setBusyLabel("Saving legend");
-    try {
-      const bundle = await saveLegend(projectId, legendSymbols);
-      applyBundle(bundle);
-    } catch (caught) {
-      if (isUnauthorized(caught)) {
-        setSessionUser(null);
-        resetWorkspace(true);
-        setError("Your session expired. Sign in again.");
-        return;
+    await runTask(
+      "Saving legend",
+      async () => {
+        const bundle = await saveLegend(projectId, legendSymbols);
+        applyBundle(bundle);
+      },
+      {
+        successMessage: "Legend saved successfully.",
+        fallbackError: "Legend save failed"
       }
-      setError(caught instanceof Error ? caught.message : "Legend save failed");
-    } finally {
-      setBusyLabel("");
-    }
+    );
   }
 
   async function handleSaveDrawing() {
     if (!projectId) {
       return;
     }
-    setBusyLabel("Saving drawing items");
-    try {
-      const bundle = await saveDrawingItems(projectId, drawingItems);
-      applyBundle(bundle);
-    } catch (caught) {
-      if (isUnauthorized(caught)) {
-        setSessionUser(null);
-        resetWorkspace(true);
-        setError("Your session expired. Sign in again.");
-        return;
+    await runTask(
+      "Saving drawing items",
+      async () => {
+        const bundle = await saveDrawingItems(projectId, drawingItems);
+        applyBundle(bundle);
+      },
+      {
+        successMessage: "Drawing MTO saved successfully.",
+        fallbackError: "Drawing save failed"
       }
-      setError(caught instanceof Error ? caught.message : "Drawing save failed");
-    } finally {
-      setBusyLabel("");
-    }
+    );
   }
 
   async function handleRunReconciliation() {
     if (!projectId) {
       return;
     }
-    setBusyLabel("Running reconciliation");
-    try {
-      const bundle = await runReconciliation(projectId);
-      applyBundle(bundle);
-      setActiveStep(3);
-    } catch (caught) {
-      if (isUnauthorized(caught)) {
-        setSessionUser(null);
-        resetWorkspace(true);
-        setError("Your session expired. Sign in again.");
-        return;
+    await runTask(
+      "Running reconciliation",
+      async () => {
+        const bundle = await runReconciliation(projectId);
+        applyBundle(bundle);
+        setActiveStep(3);
+      },
+      {
+        successMessage: "Reconciliation completed.",
+        fallbackError: "Reconciliation failed"
       }
-      setError(caught instanceof Error ? caught.message : "Reconciliation failed");
-    } finally {
-      setBusyLabel("");
-    }
+    );
   }
 
   async function handleTrainAi() {
     if (!projectId) {
       return;
     }
-    setBusyLabel("Refreshing knowledge base");
-    try {
-      const nextProgress = await submitFeedback(projectId, buildFeedback(drawingItems));
-      setProgress(nextProgress);
-      const cachedBundle = readJson<ProjectBundle>(PROJECT_CACHE_KEY);
-      if (cachedBundle) {
-        persistProjectBundle({
-          ...cachedBundle,
-          progress: nextProgress
-        });
+    await runTask(
+      "Refreshing knowledge base",
+      async () => {
+        const nextProgress = await submitFeedback(projectId, buildFeedback(drawingItems));
+        setProgress(nextProgress);
+        const cachedBundle = readJson<ProjectBundle>(PROJECT_CACHE_KEY);
+        if (cachedBundle) {
+          persistProjectBundle({
+            ...cachedBundle,
+            progress: nextProgress
+          });
+        }
+        setActiveStep(4);
+      },
+      {
+        successMessage: "AI feedback applied successfully.",
+        fallbackError: "AI feedback sync failed"
       }
-      setActiveStep(4);
-    } catch (caught) {
-      if (isUnauthorized(caught)) {
-        setSessionUser(null);
-        resetWorkspace(true);
-        setError("Your session expired. Sign in again.");
-        return;
-      }
-      setError(caught instanceof Error ? caught.message : "AI feedback sync failed");
-    } finally {
-      setBusyLabel("");
-    }
+    );
   }
+
+  async function handleDownloadExport() {
+    if (!projectId) {
+      return;
+    }
+    await runTask(
+      "Preparing export",
+      async () => {
+        await downloadExport(projectId);
+      },
+      {
+        successMessage: "Export downloaded successfully.",
+        fallbackError: "Export failed"
+      }
+    );
+  }
+
+  useEffect(() => {
+    return () => {
+      clearToastTimer();
+    };
+  }, []);
 
   const reconciliationSummary = {
     perfect: reconciliation.filter((row) => row.status === "perfect_match").length,
@@ -500,7 +590,6 @@ export default function App() {
         <div className="workspace-shell">
           <div className="workspace-inner">
             {error ? <div className="notice error">{error}</div> : null}
-            {busyLabel ? <div className="notice busy">{busyLabel}</div> : null}
 
             {authLoading ? <div className="auth-loading">Checking your Google session...</div> : null}
 
@@ -518,12 +607,12 @@ export default function App() {
 
                 {activeStep === 1 ? (
                   <DrawingStep
+                    onExport={handleDownloadExport}
                     items={drawingItems}
                     onChange={setDrawingItems}
                     onSave={handleSaveDrawing}
                     onTrain={handleTrainAi}
                     onUpload={handleDrawingUpload}
-                    projectId={projectId}
                   />
                 ) : null}
 
@@ -555,6 +644,9 @@ export default function App() {
             <span>AI MODEL ACTIVE &nbsp; BFE: ISO 9001:2015 COMPLIANT</span>
           </div>
         </footer>
+
+        {busyLabel ? <LoadingOverlay label={busyLabel} /> : null}
+        {toast ? <Toast toast={toast} onClose={() => setToast(null)} /> : null}
       </div>
     </div>
   );
@@ -669,19 +761,19 @@ function AuthGate({
 }
 
 function DrawingStep({
+  onExport,
   items,
   onChange,
   onSave,
   onTrain,
-  onUpload,
-  projectId
+  onUpload
 }: {
+  onExport: () => Promise<void>;
   items: DrawingMtoItem[];
   onChange: (items: DrawingMtoItem[]) => void;
   onSave: () => Promise<void>;
   onTrain: () => Promise<void>;
   onUpload: (file: File) => Promise<void>;
-  projectId: string;
 }) {
   return (
     <div className="page-stack">
@@ -696,7 +788,7 @@ function DrawingStep({
               accept="application/pdf,image/*"
             />
           </label>
-          <button className="cta-button green" onClick={() => downloadExport(projectId)} type="button">
+          <button className="cta-button green" onClick={onExport} type="button">
             EXPORT EXCEL
           </button>
         </div>
@@ -724,6 +816,35 @@ function DrawingStep({
           SAVE DRAWING MTO
         </button>
       </div>
+    </div>
+  );
+}
+
+function LoadingOverlay({ label }: { label: string }) {
+  return (
+    <div className="loading-overlay" role="status" aria-live="polite" aria-busy="true">
+      <div className="loading-card">
+        <div className="loading-spinner" />
+        <strong>{label}</strong>
+        <span>Please wait while the workspace is updated.</span>
+      </div>
+    </div>
+  );
+}
+
+function Toast({
+  onClose,
+  toast
+}: {
+  onClose: () => void;
+  toast: Exclude<ToastState, null>;
+}) {
+  return (
+    <div className={`toast ${toast.tone}`} role="status" aria-live="polite">
+      <span>{toast.message}</span>
+      <button onClick={onClose} type="button" aria-label="Dismiss notification">
+        <X size={14} strokeWidth={2.4} />
+      </button>
     </div>
   );
 }
