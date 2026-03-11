@@ -1,5 +1,5 @@
 import * as XLSX from "xlsx";
-import { inferItemType, type DrawingMtoItem, type LegendSymbol, type ModelMtoItem } from "@hvac/shared";
+import { inferItemType, type DrawingMtoItem, type LegendSymbol, type ModelMtoItem, type ReconciliationResult, type TrainingKnowledge } from "@hvac/shared";
 import * as pdfjs from "pdfjs-dist";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
@@ -522,6 +522,63 @@ function normalizeTagText(raw: string): string {
   return match ? `=${match[1].replace(/\s+/g, " ").trim()}` : raw.trim();
 }
 
+function normalizeKnowledgeTag(tag: string) {
+  return tag.trim().toUpperCase();
+}
+
+function deriveTagFamily(tag: string) {
+  const matches = [...tag.toUpperCase().matchAll(/[A-Z]{2}\d{3}/g)].map((match) => match[0].slice(0, 2));
+  return matches.join("-");
+}
+
+function inferDrawingDescriptionFromKnowledge(
+  tag: string,
+  knowledge?: TrainingKnowledge
+): {
+  description: string;
+  type: DrawingMtoItem["type"];
+  room?: string;
+  size?: string;
+  confidence: number;
+  predictionSource: DrawingMtoItem["predictionSource"];
+  predictionDetail: string;
+} | null {
+  if (!knowledge) {
+    return null;
+  }
+
+  const normalizedTag = normalizeKnowledgeTag(tag);
+  const exact = knowledge.exactTagRules.find((rule) => normalizeKnowledgeTag(rule.tag) === normalizedTag);
+  if (exact) {
+    return {
+      description: exact.description,
+      type: exact.type,
+      room: exact.room,
+      size: exact.size,
+      confidence: Math.max(0.9, exact.confidence),
+      predictionSource: "learned_exact_tag",
+      predictionDetail: `Learned from exact tag ${exact.tag}`
+    };
+  }
+
+  const family = deriveTagFamily(normalizedTag);
+  if (!family) {
+    return null;
+  }
+  const familyRule = knowledge.familyRules.find((rule) => rule.family === family);
+  if (!familyRule) {
+    return null;
+  }
+
+  return {
+    description: familyRule.description,
+    type: familyRule.type,
+    confidence: Math.max(0.82, familyRule.confidence),
+    predictionSource: "learned_tag_family",
+    predictionDetail: `Learned from tag family ${familyRule.family}`
+  };
+}
+
 function inferDrawingDescription(tag: string, size: string, pairedHnBases: Set<string>): string {
   if (/BP\d{3}-BP\d{3}/i.test(tag)) {
     return "DIFFERENTIAL PRESSURE TRANSMITTER";
@@ -553,7 +610,8 @@ function inferDrawingDescription(tag: string, size: string, pairedHnBases: Set<s
 export async function extractDrawingItemsFromFile(
   file: File,
   projectId: string,
-  _legendSymbols: LegendSymbol[]
+  _legendSymbols: LegendSymbol[],
+  knowledge?: TrainingKnowledge
 ): Promise<DrawingMtoItem[]> {
   const now = new Date().toISOString();
   if (!(file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"))) {
@@ -566,19 +624,22 @@ export async function extractDrawingItemsFromFile(
       .map((line) => {
         const tag = normalizeTagText(line);
         const size = (line.match(SIZE_PATTERN)?.[0] ?? "").toLowerCase();
-        const description = inferDrawingDescription(tag, size, new Set());
+        const learned = inferDrawingDescriptionFromKnowledge(tag, knowledge);
+        const description = learned?.description ?? inferDrawingDescription(tag, size, new Set());
         return {
           id: crypto.randomUUID(),
           projectId,
           source: "drawing" as const,
-          type: inferItemType(description),
+          type: learned?.type ?? inferItemType(description),
           description,
-          size,
-          room: "N/A",
+          size: learned?.size || size,
+          room: learned?.room || "N/A",
           tag,
           qty: 1,
-          confidence: 0.58,
-          verificationStatus: "pending" as const
+          confidence: learned?.confidence ?? 0.58,
+          verificationStatus: "pending" as const,
+          predictionSource: learned?.predictionSource ?? "heuristic",
+          predictionDetail: learned?.predictionDetail ?? "Predicted from baseline heuristics"
         };
       });
   }
@@ -604,21 +665,24 @@ export async function extractDrawingItemsFromFile(
   );
 
   return [...deduped.entries()].map(([tag, token]) => {
-    const size = pickPreferredSize(tokens, token, /QN\d{3}-QN\d{3}/i.test(tag) ? 360 : 170, /QN\d{3}-QN\d{3}/i.test(tag)).toLowerCase();
-    const room = nearestValue(tokens, token, ROOM_PATTERN, 360) || "N/A";
-    const description = inferDrawingDescription(tag, size, pairedHnBases);
+    const detectedSize = pickPreferredSize(tokens, token, /QN\d{3}-QN\d{3}/i.test(tag) ? 360 : 170, /QN\d{3}-QN\d{3}/i.test(tag)).toLowerCase();
+    const detectedRoom = nearestValue(tokens, token, ROOM_PATTERN, 360) || "N/A";
+    const learned = inferDrawingDescriptionFromKnowledge(tag, knowledge);
+    const description = learned?.description ?? inferDrawingDescription(tag, detectedSize, pairedHnBases);
     return {
       id: crypto.randomUUID(),
       projectId,
       source: "drawing" as const,
-      type: inferItemType(description),
+      type: learned?.type ?? inferItemType(description),
       description,
-      size,
-      room,
+      size: learned?.size || detectedSize,
+      room: learned?.room || detectedRoom,
       tag,
       qty: 1,
-      confidence: 0.72,
-      verificationStatus: "pending" as const
+      confidence: learned?.confidence ?? 0.72,
+      verificationStatus: "pending" as const,
+      predictionSource: learned?.predictionSource ?? "heuristic",
+      predictionDetail: learned?.predictionDetail ?? "Predicted from baseline heuristics"
     };
   });
 }
@@ -695,4 +759,31 @@ export function buildFeedback(items: DrawingMtoItem[]): Array<{
         afterJson: JSON.stringify(item)
       };
     });
+}
+
+export function downloadReconciliationWorkbook(projectName: string, reconciliation: ReconciliationResult[]) {
+  const worksheet = XLSX.utils.json_to_sheet(
+    reconciliation.map((row) => ({
+      status: row.status,
+      drawingReference: row.drawingReference,
+      modelReference: row.modelReference,
+      qtyDrawing: row.qtyDrawing,
+      qtyModel: row.qtyModel,
+      resolutionNotes: row.resolutionNotes
+    }))
+  );
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, "Reconciliation");
+  const output = XLSX.write(workbook, { type: "array", bookType: "xlsx" });
+  const blob = new Blob([output], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${projectName || "hvac-ai-engineer"}-reconciliation.xlsx`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }

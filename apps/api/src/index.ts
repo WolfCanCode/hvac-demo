@@ -19,6 +19,9 @@ import {
   type Project,
   type ProjectBundle,
   type ReconciliationResult,
+  type TrainingBenchmark,
+  type TrainingKnowledge,
+  type TrainingSessionSummary,
   type UserProfile
 } from "@hvac/shared";
 
@@ -294,10 +297,33 @@ async function ensureAuthSchema(db: D1Database) {
       )`
     );
 
+    await execute(
+      db,
+      `CREATE TABLE IF NOT EXISTS training_feedback (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        batch_id TEXT,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        before_json TEXT NOT NULL,
+        after_json TEXT NOT NULL,
+        context_json TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )`
+    );
+
     const projectColumns = await queryMany<{ name: string }>(db, "PRAGMA table_info(projects)");
     const hasOwnerColumn = projectColumns.some((column) => column.name === "owner_user_id");
     if (!hasOwnerColumn) {
       await execute(db, "ALTER TABLE projects ADD COLUMN owner_user_id TEXT");
+    }
+
+    const trainingFeedbackColumns = await queryMany<{ name: string }>(db, "PRAGMA table_info(training_feedback)");
+    const hasBatchIdColumn = trainingFeedbackColumns.some((column) => column.name === "batch_id");
+    if (!hasBatchIdColumn) {
+      await execute(db, "ALTER TABLE training_feedback ADD COLUMN batch_id TEXT");
     }
 
     await execute(db, "CREATE INDEX IF NOT EXISTS idx_legend_symbols_project_id ON legend_symbols(project_id)");
@@ -306,6 +332,7 @@ async function ensureAuthSchema(db: D1Database) {
     await execute(db, "CREATE INDEX IF NOT EXISTS idx_model_items_project_id ON model_items(project_id)");
     await execute(db, "CREATE INDEX IF NOT EXISTS idx_reconciliation_results_project_id ON reconciliation_results(project_id)");
     await execute(db, "CREATE INDEX IF NOT EXISTS idx_feedback_corrections_project_id ON feedback_corrections(project_id)");
+    await execute(db, "CREATE INDEX IF NOT EXISTS idx_training_feedback_user_id ON training_feedback(user_id)");
     await execute(db, "CREATE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)");
     await execute(db, "CREATE INDEX IF NOT EXISTS idx_projects_owner_user_id ON projects(owner_user_id)");
   })().catch((error) => {
@@ -314,6 +341,252 @@ async function ensureAuthSchema(db: D1Database) {
   });
 
   return schemaReadyPromise;
+}
+
+function computeGlobalTrainingBenchmark(rows: Array<Row & { user_id: string; batch_id: string | null }>): TrainingBenchmark {
+  const totalCorrections = rows.length;
+  const approvedCount = rows.filter((row) => row.action === "approved").length;
+  const correctedCount = rows.filter((row) => row.action === "rejected" || row.action === "edited").length;
+  const currentAccuracy = totalCorrections === 0 ? 0 : Number(((approvedCount / totalCorrections) * 100).toFixed(1));
+  const reliabilityIndex = currentAccuracy >= 90 ? "High" : currentAccuracy >= 70 ? "Medium" : "Low";
+  const contributors = new Set(rows.map((row) => String(row.user_id))).size;
+  const batches = new Map<string, Array<Row & { user_id: string; batch_id: string | null }>>();
+
+  for (const row of rows) {
+    const batchId = row.batch_id ? String(row.batch_id) : `legacy-${row.id}`;
+    const current = batches.get(batchId) ?? [];
+    current.push(row);
+    batches.set(batchId, current);
+  }
+
+  const history = [...batches.entries()]
+    .sort((left, right) => {
+      const leftCreated = String(left[1][0]?.created_at ?? "");
+      const rightCreated = String(right[1][0]?.created_at ?? "");
+      return leftCreated.localeCompare(rightCreated);
+    })
+    .slice(-6)
+    .map(([_, batchRows], index) => {
+      const batchApproved = batchRows.filter((row) => row.action === "approved").length;
+      const batchAccuracy = batchRows.length === 0 ? 0 : Number(((batchApproved / batchRows.length) * 100).toFixed(1));
+      return {
+        label: `S${index + 1}`,
+        value: batchAccuracy
+      };
+    });
+
+  return {
+    currentAccuracy,
+    learningSessions: batches.size,
+    errorsCorrected: correctedCount,
+    reliabilityIndex,
+    reviewedRows: totalCorrections,
+    history,
+    contributors,
+    totalCorrections,
+    lastUpdated: rows.at(-1)?.created_at ? String(rows.at(-1)?.created_at) : undefined
+  };
+}
+
+async function getGlobalTrainingBenchmark(db: D1Database) {
+  const rows = await queryMany<Row & { user_id: string; batch_id: string | null }>(
+    db,
+    "SELECT id, user_id, batch_id, action, created_at FROM training_feedback ORDER BY created_at ASC"
+  );
+  return computeGlobalTrainingBenchmark(rows);
+}
+
+function normalizeKnowledgeTag(tag: string) {
+  return tag.trim().toUpperCase();
+}
+
+function deriveTagFamily(tag: string) {
+  const matches = [...tag.toUpperCase().matchAll(/[A-Z]{2}\d{3}/g)].map((match) => match[0].slice(0, 2));
+  if (matches.length === 0) {
+    return "";
+  }
+  return matches.join("-");
+}
+
+function buildTrainingKnowledge(rows: Array<Row & { after_json: string; created_at: string }>): TrainingKnowledge {
+  const exactCounts = new Map<string, Map<string, { count: number; description: string; type: string; room?: string; size?: string }>>();
+  const familyCounts = new Map<string, Map<string, { count: number; description: string; type: string }>>();
+  let updatedAt = "";
+
+  for (const row of rows) {
+    updatedAt = String(row.created_at ?? updatedAt);
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(String(row.after_json ?? "{}")) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+
+    const tag = typeof parsed.tag === "string" ? normalizeKnowledgeTag(parsed.tag) : "";
+    const description = typeof parsed.description === "string" ? parsed.description.trim().toUpperCase() : "";
+    const type = typeof parsed.type === "string" ? parsed.type : "";
+    const room = typeof parsed.room === "string" ? parsed.room.trim().toUpperCase() : "";
+    const size = typeof parsed.size === "string" ? parsed.size.trim().toLowerCase() : "";
+
+    if (!tag || !description || !type) {
+      continue;
+    }
+
+    const exactKey = tag;
+    const exactEntryKey = `${description}|${type}|${room}|${size}`;
+    const exactVariants = exactCounts.get(exactKey) ?? new Map();
+    const currentExact = exactVariants.get(exactEntryKey) ?? { count: 0, description, type, room, size };
+    currentExact.count += 1;
+    exactVariants.set(exactEntryKey, currentExact);
+    exactCounts.set(exactKey, exactVariants);
+
+    const family = deriveTagFamily(tag);
+    if (!family) {
+      continue;
+    }
+    const familyEntryKey = `${description}|${type}`;
+    const familyVariants = familyCounts.get(family) ?? new Map();
+    const currentFamily = familyVariants.get(familyEntryKey) ?? { count: 0, description, type };
+    currentFamily.count += 1;
+    familyVariants.set(familyEntryKey, currentFamily);
+    familyCounts.set(family, familyVariants);
+  }
+
+  const exactTagRules = [...exactCounts.entries()]
+    .map(([tag, variants]) => {
+      const sorted = [...variants.values()].sort((left, right) => right.count - left.count);
+      const winner = sorted[0];
+      const total = sorted.reduce((sum, entry) => sum + entry.count, 0);
+      return {
+        tag,
+        description: winner.description,
+        type: winner.type as TrainingKnowledge["exactTagRules"][number]["type"],
+        room: winner.room || undefined,
+        size: winner.size || undefined,
+        confidence: total === 0 ? 0 : Number((winner.count / total).toFixed(2)),
+        examples: total
+      };
+    })
+    .filter((rule) => rule.examples > 0);
+
+  const familyRules = [...familyCounts.entries()]
+    .map(([family, variants]) => {
+      const sorted = [...variants.values()].sort((left, right) => right.count - left.count);
+      const winner = sorted[0];
+      const total = sorted.reduce((sum, entry) => sum + entry.count, 0);
+      return {
+        family,
+        description: winner.description,
+        type: winner.type as TrainingKnowledge["familyRules"][number]["type"],
+        confidence: total === 0 ? 0 : Number((winner.count / total).toFixed(2)),
+        examples: total
+      };
+    })
+    .filter((rule) => rule.examples > 0);
+
+  return {
+    exactTagRules,
+    familyRules,
+    updatedAt: updatedAt || undefined
+  };
+}
+
+async function getTrainingKnowledge(db: D1Database) {
+  const rows = await queryMany<Row & { after_json: string; created_at: string }>(
+    db,
+    "SELECT after_json, created_at FROM training_feedback WHERE action IN ('approved', 'edited') ORDER BY created_at ASC"
+  );
+  return buildTrainingKnowledge(rows);
+}
+
+function buildTrainingSessions(
+  rows: Array<
+    Row & {
+      user_id: string;
+      email: string;
+      batch_id: string | null;
+      context_json: string | null;
+      created_at: string;
+    }
+  >
+): TrainingSessionSummary[] {
+  const grouped = new Map<
+    string,
+    {
+      email: string;
+      createdAt: string;
+      projectName?: string;
+      approvedCount: number;
+      correctedCount: number;
+      totalCorrections: number;
+    }
+  >();
+
+  for (const row of rows) {
+    const batchId = row.batch_id ? String(row.batch_id) : `legacy-${row.id}`;
+    const existing = grouped.get(batchId) ?? {
+      email: String(row.email),
+      createdAt: String(row.created_at),
+      projectName: undefined,
+      approvedCount: 0,
+      correctedCount: 0,
+      totalCorrections: 0
+    };
+
+    existing.totalCorrections += 1;
+    if (row.action === "approved") {
+      existing.approvedCount += 1;
+    }
+    if (row.action === "rejected" || row.action === "edited") {
+      existing.correctedCount += 1;
+    }
+
+    if (!existing.projectName && row.context_json) {
+      try {
+        const context = JSON.parse(String(row.context_json)) as { projectName?: string };
+        existing.projectName = context.projectName;
+      } catch {
+        // Ignore malformed context.
+      }
+    }
+
+    grouped.set(batchId, existing);
+  }
+
+  return [...grouped.entries()]
+    .map(([id, session]) => ({
+      id,
+      email: session.email,
+      createdAt: session.createdAt,
+      projectName: session.projectName,
+      currentAccuracy:
+        session.totalCorrections === 0 ? 0 : Number(((session.approvedCount / session.totalCorrections) * 100).toFixed(1)),
+      totalCorrections: session.totalCorrections,
+      approvedCount: session.approvedCount,
+      correctedCount: session.correctedCount
+    }))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+}
+
+async function getTrainingSessions(db: D1Database) {
+  const rows = await queryMany<
+    Row & {
+      user_id: string;
+      email: string;
+      batch_id: string | null;
+      context_json: string | null;
+      created_at: string;
+    }
+  >(
+    db,
+    `SELECT training_feedback.id, training_feedback.user_id, training_feedback.batch_id, training_feedback.action,
+            training_feedback.context_json, training_feedback.created_at, users.email
+     FROM training_feedback
+     JOIN users ON users.id = training_feedback.user_id
+     ORDER BY training_feedback.created_at DESC`
+  );
+
+  return buildTrainingSessions(rows);
 }
 
 async function signSessionToken(user: UserProfile, env: Bindings) {
@@ -733,8 +1006,7 @@ app.post("/api/auth/google", async (c) => {
   const user = await upsertUser(c.env.DB, googleUser);
   const sessionToken = await signSessionToken(user, c.env);
   setSessionCookie(c, sessionToken);
-  const projectBundle = await getCurrentProjectBundle(c.env.DB, user.id);
-  return c.json({ user, projectBundle, sessionToken });
+  return c.json({ user, sessionToken });
 });
 
 app.get("/api/auth/me", async (c) => {
@@ -1043,6 +1315,92 @@ app.post("/api/projects/:projectId/feedback", async (c) => {
 
   const bundle = await loadProjectBundle(c.env.DB, projectId);
   return c.json(bundle?.progress ?? null);
+});
+
+app.post("/api/training/feedback", async (c) => {
+  const session = requireSessionUser(c);
+  if (!session.ok) {
+    return session.response;
+  }
+
+  const payload = z.object({
+    corrections: z.array(
+      z.object({
+        targetType: z.enum(["drawing_item", "legend_symbol"]),
+        targetId: z.string(),
+        action: z.enum(["approved", "rejected", "edited"]),
+        beforeJson: z.string(),
+        afterJson: z.string()
+      })
+    ),
+    context: z
+      .object({
+        projectName: z.string(),
+        legendSymbolsCount: z.number(),
+        drawingItemsCount: z.number(),
+        modelItemsCount: z.number(),
+        currentAccuracy: z.number()
+      })
+      .optional()
+  }).parse(await c.req.json());
+
+  const timestamp = now();
+  const batchId = crypto.randomUUID();
+  for (const correction of payload.corrections) {
+    await execute(
+      c.env.DB,
+      "INSERT INTO training_feedback (id, user_id, batch_id, target_type, target_id, action, before_json, after_json, context_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [
+        crypto.randomUUID(),
+        session.user.id,
+        batchId,
+        correction.targetType,
+        correction.targetId,
+        correction.action,
+        correction.beforeJson,
+        correction.afterJson,
+        payload.context ? JSON.stringify(payload.context) : "",
+        timestamp
+      ]
+    );
+  }
+
+  const [benchmark, knowledge, sessions] = await Promise.all([
+    getGlobalTrainingBenchmark(c.env.DB),
+    getTrainingKnowledge(c.env.DB),
+    getTrainingSessions(c.env.DB)
+  ]);
+  return c.json({ ok: true, savedCount: payload.corrections.length, benchmark, knowledge, sessions });
+});
+
+app.get("/api/training/benchmark", async (c) => {
+  const session = requireSessionUser(c);
+  if (!session.ok) {
+    return session.response;
+  }
+
+  const benchmark = await getGlobalTrainingBenchmark(c.env.DB);
+  return c.json(benchmark);
+});
+
+app.get("/api/training/knowledge", async (c) => {
+  const session = requireSessionUser(c);
+  if (!session.ok) {
+    return session.response;
+  }
+
+  const knowledge = await getTrainingKnowledge(c.env.DB);
+  return c.json(knowledge);
+});
+
+app.get("/api/training/sessions", async (c) => {
+  const session = requireSessionUser(c);
+  if (!session.ok) {
+    return session.response;
+  }
+
+  const sessions = await getTrainingSessions(c.env.DB);
+  return c.json({ sessions });
 });
 
 app.get("/api/projects/:projectId/progress", async (c) => {

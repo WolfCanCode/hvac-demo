@@ -9,6 +9,7 @@ export type HvacItemType =
   | "other";
 
 export type VerificationStatus = "pending" | "approved" | "rejected" | "edited";
+export type PredictionSource = "learned_exact_tag" | "learned_tag_family" | "heuristic";
 
 export type ReconciliationStatus =
   | "perfect_match"
@@ -72,6 +73,8 @@ export interface NormalizedMtoRow {
   qty: number;
   confidence: number;
   verificationStatus: VerificationStatus;
+  predictionSource?: PredictionSource;
+  predictionDetail?: string;
 }
 
 export interface DrawingMtoItem extends NormalizedMtoRow {}
@@ -139,4 +142,65 @@ export interface UploadSignature {
   assetId: string;
   objectKey: string;
   uploadUrl: string;
+}
+
+export interface WorkspaceUploadMeta {
+  kind: DrawingAsset["kind"];
+  fileName: string;
+  timestamp: string;
+}
+
+export interface LocalWorkspaceSnapshot {
+  version: number;
+  projectId: string;
+  projectName: string;
+  activeStep: number;
+  legendSymbols: LegendSymbol[];
+  drawingItems: DrawingMtoItem[];
+  modelItems: ModelMtoItem[];
+  reconciliation: ReconciliationResult[];
+  progress: AiProgressSnapshot;
+  uploadMeta: WorkspaceUploadMeta[];
+  updatedAt: string;
+}
+
+export interface TrainingBenchmark extends AiProgressSnapshot {
+  contributors: number;
+  totalCorrections: number;
+  lastUpdated?: string;
+}
+
+export interface LearnedExactTagRule {
+  tag: string;
+  description: string;
+  type: HvacItemType;
+  room?: string;
+  size?: string;
+  confidence: number;
+  examples: number;
+}
+
+export interface LearnedTagFamilyRule {
+  family: string;
+  description: string;
+  type: HvacItemType;
+  confidence: number;
+  examples: number;
+}
+
+export interface TrainingKnowledge {
+  exactTagRules: LearnedExactTagRule[];
+  familyRules: LearnedTagFamilyRule[];
+  updatedAt?: string;
+}
+
+export interface TrainingSessionSummary {
+  id: string;
+  email: string;
+  createdAt: string;
+  projectName?: string;
+  currentAccuracy: number;
+  totalCorrections: number;
+  approvedCount: number;
+  correctedCount: number;
 }

@@ -9,7 +9,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "deploy": "wrangler deploy",
     "d1:migrate": "wrangler d1 migrations apply hvac_ai_engineer --local",
-    "d1:migrate:remote": "wrangler d1 migrations apply hvac_ai_engineer"
+    "d1:migrate:remote": "wrangler d1 migrations apply hvac_ai_engineer",
+    "d1:truncate": "wrangler d1 execute hvac_ai_engineer --local --file ./scripts/truncate.sql",
+    "d1:truncate:remote": "wrangler d1 execute hvac_ai_engineer --remote --file ./scripts/truncate.sql"
   },
   "dependencies": {
     "@hvac/shared": "0.1.0",

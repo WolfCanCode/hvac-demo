@@ -1,13 +1,4 @@
-import type {
-  AiProgressSnapshot,
-  AuthSession,
-  DrawingAsset,
-  DrawingMtoItem,
-  LegendSymbol,
-  ModelMtoItem,
-  ProjectBundle,
-  UploadSignature
-} from "@hvac/shared";
+import type { AuthSession, TrainingBenchmark, TrainingKnowledge, TrainingSessionSummary } from "@hvac/shared";
 
 const configuredApiUrl = import.meta.env.VITE_API_URL?.trim();
 const API_URL =
@@ -82,7 +73,7 @@ export function getAuthSession() {
 }
 
 export function signInWithGoogle(credential: string) {
-  return request<AuthSession & { projectBundle: ProjectBundle; sessionToken: string }>("/api/auth/google", {
+  return request<AuthSession & { sessionToken: string }>("/api/auth/google", {
     method: "POST",
     body: JSON.stringify({ credential })
   });
@@ -94,142 +85,42 @@ export function logout() {
   });
 }
 
-export function createProject() {
-  return request<ProjectBundle>("/api/projects", { method: "POST" });
-}
-
-export function getCurrentProject() {
-  return request<ProjectBundle>("/api/projects/current");
-}
-
-export function getProject(projectId: string) {
-  return request<ProjectBundle>(`/api/projects/${projectId}`);
-}
-
-export function signUpload(projectId: string, file: File, kind: DrawingAsset["kind"]) {
-  return request<UploadSignature>(`/api/projects/${projectId}/uploads/sign`, {
-    method: "POST",
-    body: JSON.stringify({
-      fileName: file.name,
-      kind,
-      mimeType: file.type || "application/octet-stream"
-    })
-  });
-}
-
-export async function uploadFile(signature: UploadSignature, file: File) {
-  const response = await fetch(`${API_URL}${signature.uploadUrl}`, {
-    method: "PUT",
-    credentials: "include",
-    headers: {
-      ...buildHeaders(),
-      "Content-Type": file.type || "application/octet-stream"
-    },
-    body: file
-  });
-
-  if (!response.ok) {
-    let message = `Upload failed: ${response.status}`;
-    try {
-      const payload = (await response.json()) as { message?: string };
-      if (payload.message) {
-        message = payload.message;
-      }
-    } catch {
-      // Ignore non-JSON failures.
-    }
-    throw new ApiError(message, response.status);
-  }
-}
-
-export function extractLegend(projectId: string, text: string) {
-  return request<{ symbols: LegendSymbol[] }>(`/api/projects/${projectId}/legend/extract`, {
-    method: "POST",
-    body: JSON.stringify({ text })
-  });
-}
-
-export function saveLegend(projectId: string, symbols: LegendSymbol[]) {
-  return request<ProjectBundle>(`/api/projects/${projectId}/legend`, {
-    method: "PUT",
-    body: JSON.stringify({
-      symbols: symbols.map(({ name, description, notes, previewUrl }) => ({ name, description, notes, previewUrl }))
-    })
-  });
-}
-
-export function extractDrawing(projectId: string, text: string, legendSymbols: LegendSymbol[]) {
-  return request<{ items: DrawingMtoItem[] }>(`/api/projects/${projectId}/drawing/extract`, {
-    method: "POST",
-    body: JSON.stringify({
-      text,
-      legendSymbols
-    })
-  });
-}
-
-export function saveDrawingItems(projectId: string, items: DrawingMtoItem[]) {
-  return request<ProjectBundle>(`/api/projects/${projectId}/drawing/items`, {
-    method: "PUT",
-    body: JSON.stringify({ items })
-  });
-}
-
-export function importModelItems(projectId: string, fileName: string, items: ModelMtoItem[]) {
-  return request<ProjectBundle>(`/api/projects/${projectId}/model/import`, {
-    method: "POST",
-    body: JSON.stringify({ fileName, items })
-  });
-}
-
-export function runReconciliation(projectId: string) {
-  return request<ProjectBundle>(`/api/projects/${projectId}/reconciliation/run`, {
-    method: "POST"
-  });
-}
-
-export function submitFeedback(
-  projectId: string,
+export function submitTrainingFeedback(
   corrections: Array<{
     targetType: "drawing_item" | "legend_symbol";
     targetId: string;
     action: "approved" | "rejected" | "edited";
     beforeJson: string;
     afterJson: string;
-  }>
+  }>,
+  context?: {
+    projectName: string;
+    legendSymbolsCount: number;
+    drawingItemsCount: number;
+    modelItemsCount: number;
+    currentAccuracy: number;
+  }
 ) {
-  return request<AiProgressSnapshot>(`/api/projects/${projectId}/feedback`, {
+  return request<{
+    ok: true;
+    savedCount: number;
+    benchmark: TrainingBenchmark;
+    knowledge: TrainingKnowledge;
+    sessions: TrainingSessionSummary[];
+  }>("/api/training/feedback", {
     method: "POST",
-    body: JSON.stringify({ corrections })
+    body: JSON.stringify({ corrections, context })
   });
 }
 
-export function downloadExport(projectId: string) {
-  return fetch(`${API_URL}/api/projects/${projectId}/export.xlsx`, {
-    credentials: "include",
-    headers: buildHeaders()
-  }).then(async (response) => {
-    if (!response.ok) {
-      let message = `Export failed: ${response.status}`;
-      try {
-        const payload = (await response.json()) as { message?: string };
-        if (payload.message) {
-          message = payload.message;
-        }
-      } catch {
-        // Ignore non-JSON failures.
-      }
-      throw new ApiError(message, response.status);
-    }
+export function getTrainingBenchmark() {
+  return request<TrainingBenchmark>("/api/training/benchmark");
+}
 
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `reconciliation-${projectId}.xlsx`;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-  });
+export function getTrainingKnowledge() {
+  return request<TrainingKnowledge>("/api/training/knowledge");
+}
+
+export function getTrainingSessions() {
+  return request<{ sessions: TrainingSessionSummary[] }>("/api/training/sessions");
 }

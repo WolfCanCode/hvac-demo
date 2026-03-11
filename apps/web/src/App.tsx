@@ -5,30 +5,31 @@ import type {
   DrawingMtoItem,
   HvacItemType,
   LegendSymbol,
+  LocalWorkspaceSnapshot,
   ModelMtoItem,
-  ProjectBundle,
   ReconciliationResult,
+  TrainingBenchmark,
+  TrainingKnowledge,
+  TrainingSessionSummary,
   UserProfile,
-  VerificationStatus
+  VerificationStatus,
+  WorkspaceUploadMeta
 } from "@hvac/shared";
+import { computeAiProgress, reconcileRows } from "@hvac/shared";
 import {
   ApiError,
-  downloadExport,
   getAuthSession,
-  getCurrentProject,
-  importModelItems,
+  getTrainingBenchmark,
+  getTrainingKnowledge,
+  getTrainingSessions,
   logout,
-  runReconciliation,
-  saveDrawingItems,
-  saveLegend,
-  signUpload,
   signInWithGoogle,
   storeSessionToken,
-  submitFeedback,
-  uploadFile
+  submitTrainingFeedback
 } from "./lib/api";
 import {
   buildFeedback,
+  downloadReconciliationWorkbook,
   extractDrawingItemsFromFile,
   extractLegendFromFile,
   parseSpreadsheet
@@ -37,16 +38,11 @@ import { ProgressChart } from "./components/ProgressChart";
 import { StatCard } from "./components/StatCard";
 import { StepTabs } from "./components/StepTabs";
 
-function hydrateProject(bundle: ProjectBundle) {
-  return {
-    project: bundle.project,
-    legendSymbols: bundle.legendSymbols,
-    drawingItems: bundle.drawingItems,
-    modelItems: bundle.modelItems,
-    reconciliation: bundle.reconciliation,
-    progress: bundle.progress
-  };
-}
+const DEFAULT_PROJECT_NAME = "HVAC AI Engineer MTO";
+const AUTH_CREDENTIAL_KEY = "hvac-google-credential";
+const USER_SNAPSHOT_KEY = "hvac-session-user";
+const WORKSPACE_STORAGE_KEY = "hvac-local-workspace";
+const LOCAL_WORKSPACE_VERSION = 1;
 
 function emptyProgress(): AiProgressSnapshot {
   return {
@@ -59,9 +55,20 @@ function emptyProgress(): AiProgressSnapshot {
   };
 }
 
-const AUTH_CREDENTIAL_KEY = "hvac-google-credential";
-const USER_SNAPSHOT_KEY = "hvac-session-user";
-const PROJECT_CACHE_KEY = "hvac-project-cache";
+function emptyTrainingBenchmark(): TrainingBenchmark {
+  return {
+    ...emptyProgress(),
+    contributors: 0,
+    totalCorrections: 0
+  };
+}
+
+function emptyTrainingKnowledge(): TrainingKnowledge {
+  return {
+    exactTagRules: [],
+    familyRules: []
+  };
+}
 
 type ToastState = {
   tone: "success" | "error";
@@ -82,12 +89,70 @@ function readJson<T>(key: string): T | null {
   }
 }
 
+function createEmptyWorkspaceSnapshot(projectId = crypto.randomUUID()): LocalWorkspaceSnapshot {
+  return {
+    version: LOCAL_WORKSPACE_VERSION,
+    projectId,
+    projectName: DEFAULT_PROJECT_NAME,
+    activeStep: 0,
+    legendSymbols: [],
+    drawingItems: [],
+    modelItems: [],
+    reconciliation: [],
+    progress: emptyProgress(),
+    uploadMeta: [],
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function readWorkspaceSnapshot() {
+  const snapshot = readJson<LocalWorkspaceSnapshot>(WORKSPACE_STORAGE_KEY);
+  if (!snapshot) {
+    return null;
+  }
+  if (snapshot.version !== LOCAL_WORKSPACE_VERSION) {
+    window.localStorage.removeItem(WORKSPACE_STORAGE_KEY);
+    return null;
+  }
+  return snapshot;
+}
+
+function buildProgressSnapshot(
+  drawingItems: DrawingMtoItem[],
+  learningSessions: number,
+  history: AiProgressSnapshot["history"] = []
+): AiProgressSnapshot {
+  return {
+    ...computeAiProgress(drawingItems, learningSessions),
+    history
+  };
+}
+
+function appendProgressHistory(
+  history: AiProgressSnapshot["history"],
+  learningSessions: number,
+  currentAccuracy: number
+) {
+  return [...history, { label: `S${learningSessions}`, value: currentAccuracy }].slice(-6);
+}
+
+function updateUploadMeta(
+  current: WorkspaceUploadMeta[],
+  kind: WorkspaceUploadMeta["kind"],
+  fileName: string
+) {
+  return [
+    { kind, fileName, timestamp: new Date().toISOString() },
+    ...current.filter((entry) => entry.kind !== kind)
+  ];
+}
+
 export default function App() {
   const googleButtonRef = useRef<HTMLDivElement | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const [activeStep, setActiveStep] = useState(0);
-  const [projectId, setProjectId] = useState("");
-  const [projectName, setProjectName] = useState("HVAC AI Engineer MTO");
+  const [projectId, setProjectId] = useState<string>(() => crypto.randomUUID());
+  const [projectName, setProjectName] = useState(DEFAULT_PROJECT_NAME);
   const [sessionUser, setSessionUser] = useState<UserProfile | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [avatarFailed, setAvatarFailed] = useState(false);
@@ -96,6 +161,10 @@ export default function App() {
   const [modelItems, setModelItems] = useState<ModelMtoItem[]>([]);
   const [reconciliation, setReconciliation] = useState<ReconciliationResult[]>([]);
   const [progress, setProgress] = useState<AiProgressSnapshot>(emptyProgress());
+  const [trainingBenchmark, setTrainingBenchmark] = useState<TrainingBenchmark>(emptyTrainingBenchmark());
+  const [trainingKnowledge, setTrainingKnowledge] = useState<TrainingKnowledge>(emptyTrainingKnowledge());
+  const [trainingSessions, setTrainingSessions] = useState<TrainingSessionSummary[]>([]);
+  const [uploadMeta, setUploadMeta] = useState<WorkspaceUploadMeta[]>([]);
   const [busyLabel, setBusyLabel] = useState("");
   const [error, setError] = useState("");
   const [toast, setToast] = useState<ToastState>(null);
@@ -140,41 +209,65 @@ export default function App() {
     }
   }
 
-  function persistProjectBundle(bundle: ProjectBundle | null) {
-    if (bundle) {
-      window.localStorage.setItem(PROJECT_CACHE_KEY, JSON.stringify(bundle));
-      window.localStorage.setItem("hvac-project-id", bundle.project.id);
-    } else {
-      window.localStorage.removeItem(PROJECT_CACHE_KEY);
-      window.localStorage.removeItem("hvac-project-id");
+  function writeWorkspaceSnapshot(snapshot: LocalWorkspaceSnapshot | null) {
+    if (snapshot) {
+      window.localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(snapshot));
+      return;
     }
+    window.localStorage.removeItem(WORKSPACE_STORAGE_KEY);
   }
 
-  function applyBundle(bundle: ProjectBundle, persist = true) {
-    const state = hydrateProject(bundle);
-    setProjectId(bundle.project.id);
-    setProjectName(bundle.project.name);
-    setLegendSymbols(state.legendSymbols);
-    setDrawingItems(state.drawingItems);
-    setModelItems(state.modelItems);
-    setReconciliation(state.reconciliation);
-    setProgress(state.progress);
+  function captureWorkspaceSnapshot(overrides: Partial<LocalWorkspaceSnapshot> = {}): LocalWorkspaceSnapshot {
+    return {
+      version: LOCAL_WORKSPACE_VERSION,
+      projectId,
+      projectName,
+      activeStep,
+      legendSymbols,
+      drawingItems,
+      modelItems,
+      reconciliation,
+      progress,
+      uploadMeta,
+      updatedAt: new Date().toISOString(),
+      ...overrides
+    };
+  }
+
+  function persistWorkspaceSnapshot(overrides: Partial<LocalWorkspaceSnapshot> = {}) {
+    writeWorkspaceSnapshot(captureWorkspaceSnapshot(overrides));
+  }
+
+  function patchStoredWorkspaceSnapshot(overrides: Partial<LocalWorkspaceSnapshot>) {
+    const current = readWorkspaceSnapshot();
+    writeWorkspaceSnapshot({
+      ...(current ?? captureWorkspaceSnapshot()),
+      ...overrides,
+      version: LOCAL_WORKSPACE_VERSION,
+      updatedAt: new Date().toISOString()
+    });
+  }
+
+  function applyWorkspaceSnapshot(snapshot: LocalWorkspaceSnapshot, persist = true) {
+    setProjectId(snapshot.projectId);
+    setProjectName(snapshot.projectName);
+    setActiveStep(snapshot.activeStep);
+    setLegendSymbols(snapshot.legendSymbols);
+    setDrawingItems(snapshot.drawingItems);
+    setModelItems(snapshot.modelItems);
+    setReconciliation(snapshot.reconciliation);
+    setProgress(snapshot.progress);
+    setUploadMeta(snapshot.uploadMeta ?? []);
     if (persist) {
-      persistProjectBundle(bundle);
+      writeWorkspaceSnapshot(snapshot);
     }
   }
 
   function resetWorkspace(clearStoredAuth = false) {
-    setActiveStep(0);
-    setProjectId("");
-    setProjectName("HVAC AI Engineer MTO");
+    const emptyWorkspace = createEmptyWorkspaceSnapshot();
+    applyWorkspaceSnapshot(emptyWorkspace, false);
     setAvatarFailed(false);
-    setLegendSymbols([]);
-    setDrawingItems([]);
-    setModelItems([]);
-    setReconciliation([]);
-    setProgress(emptyProgress());
-    persistProjectBundle(null);
+    writeWorkspaceSnapshot(null);
     if (clearStoredAuth) {
       window.localStorage.removeItem(AUTH_CREDENTIAL_KEY);
       persistSessionUser(null);
@@ -223,22 +316,34 @@ export default function App() {
     }
   }
 
-  async function loadWorkspace() {
-    const bundle = await getCurrentProject();
-    applyBundle(bundle);
+  async function refreshTrainingBenchmark() {
+    try {
+      const [benchmark, knowledge, sessions] = await Promise.all([
+        getTrainingBenchmark(),
+        getTrainingKnowledge(),
+        getTrainingSessions()
+      ]);
+      setTrainingBenchmark(benchmark);
+      setTrainingKnowledge(knowledge);
+      setTrainingSessions(Array.isArray(sessions.sessions) ? sessions.sessions : []);
+    } catch {
+      setTrainingBenchmark(emptyTrainingBenchmark());
+      setTrainingKnowledge(emptyTrainingKnowledge());
+      setTrainingSessions([]);
+    }
   }
 
   useEffect(() => {
     async function bootstrap() {
       const cachedUser = readJson<UserProfile>(USER_SNAPSHOT_KEY);
-      const cachedBundle = readJson<ProjectBundle>(PROJECT_CACHE_KEY);
+      const cachedWorkspace = readWorkspaceSnapshot();
       const cachedCredential = window.localStorage.getItem(AUTH_CREDENTIAL_KEY);
 
       if (cachedUser) {
         setSessionUser(cachedUser);
       }
-      if (cachedBundle) {
-        applyBundle(cachedBundle, false);
+      if (cachedWorkspace) {
+        applyWorkspaceSnapshot(cachedWorkspace, false);
       }
 
       try {
@@ -246,10 +351,14 @@ export default function App() {
         const session = await getAuthSession();
         setSessionUser(session.user);
         persistSessionUser(session.user);
-        if (session.user) {
-          setBusyLabel("Loading workspace");
-          await loadWorkspace();
+        if (session.user && !cachedWorkspace) {
+          const emptyWorkspace = createEmptyWorkspaceSnapshot();
+          applyWorkspaceSnapshot(emptyWorkspace);
+          await refreshTrainingBenchmark();
           return;
+        }
+        if (session.user) {
+          await refreshTrainingBenchmark();
         }
 
         if (cachedCredential) {
@@ -258,8 +367,10 @@ export default function App() {
           storeSessionToken(restored.sessionToken);
           setSessionUser(restored.user);
           persistSessionUser(restored.user);
-          if (restored.user) {
-            applyBundle(restored.projectBundle);
+          await refreshTrainingBenchmark();
+          if (restored.user && !cachedWorkspace) {
+            const emptyWorkspace = createEmptyWorkspaceSnapshot();
+            applyWorkspaceSnapshot(emptyWorkspace);
           }
         }
       } catch (caught) {
@@ -295,7 +406,11 @@ export default function App() {
     setSessionUser(session.user);
     persistSessionUser(session.user);
     setAvatarFailed(false);
-    applyBundle(session.projectBundle);
+    await refreshTrainingBenchmark();
+    if (!readWorkspaceSnapshot()) {
+      const emptyWorkspace = createEmptyWorkspaceSnapshot();
+      applyWorkspaceSnapshot(emptyWorkspace);
+    }
     showToast("success", `Signed in as ${session.user?.name ?? "Google user"}.`);
   }
 
@@ -358,30 +473,36 @@ export default function App() {
       await logout();
     } finally {
       setSessionUser(null);
+      persistSessionUser(null);
+      setTrainingBenchmark(emptyTrainingBenchmark());
+      setTrainingKnowledge(emptyTrainingKnowledge());
+      setTrainingSessions([]);
       resetWorkspace(true);
       setBusyLabel("");
     }
   }
 
-  async function persistFile(kind: "legend" | "drawing" | "model", file: File) {
-    if (!projectId) {
+  async function handleClearAllData() {
+    if (!window.confirm("Clear all local workspace data and sign out?")) {
       return;
     }
-    const signature = await signUpload(projectId, file, kind);
-    await uploadFile(signature, file);
+    await handleLogout();
   }
 
   async function handleLegendUpload(file: File) {
-    if (!projectId) {
-      return;
-    }
     const ok = await runTask(
       "Scanning legend",
       async () => {
-        await persistFile("legend", file);
         const symbols = await extractLegendFromFile(file, projectId);
+        const nextUploadMeta = updateUploadMeta(uploadMeta, "legend", file.name);
         setLegendSymbols(symbols);
         setActiveStep(0);
+        setUploadMeta(nextUploadMeta);
+        persistWorkspaceSnapshot({
+          legendSymbols: symbols,
+          activeStep: 0,
+          uploadMeta: nextUploadMeta
+        });
       },
       {
         successMessage: `Legend extracted from ${file.name}.`,
@@ -395,16 +516,24 @@ export default function App() {
   }
 
   async function handleDrawingUpload(file: File) {
-    if (!projectId) {
-      return;
-    }
     const ok = await runTask(
       "Analyzing drawing MTO",
       async () => {
-        await persistFile("drawing", file);
-        const items = await extractDrawingItemsFromFile(file, projectId, legendSymbols);
+        const items = await extractDrawingItemsFromFile(file, projectId, legendSymbols, trainingKnowledge);
+        const nextProgress = buildProgressSnapshot(items, progress.learningSessions, progress.history);
+        const nextUploadMeta = updateUploadMeta(uploadMeta, "drawing", file.name);
         setDrawingItems(items);
+        setProgress(nextProgress);
+        setReconciliation([]);
         setActiveStep(1);
+        setUploadMeta(nextUploadMeta);
+        persistWorkspaceSnapshot({
+          drawingItems: items,
+          progress: nextProgress,
+          reconciliation: [],
+          activeStep: 1,
+          uploadMeta: nextUploadMeta
+        });
       },
       {
         successMessage: `Drawing analysis completed for ${file.name}.`,
@@ -418,17 +547,21 @@ export default function App() {
   }
 
   async function handleModelUpload(file: File) {
-    if (!projectId) {
-      return;
-    }
     const ok = await runTask(
       "Parsing model MTO",
       async () => {
-        await persistFile("model", file);
         const items = await parseSpreadsheet(file, projectId);
-        const bundle = await importModelItems(projectId, file.name, items);
-        applyBundle(bundle);
+        const nextUploadMeta = updateUploadMeta(uploadMeta, "model", file.name);
+        setModelItems(items);
+        setReconciliation([]);
         setActiveStep(2);
+        setUploadMeta(nextUploadMeta);
+        persistWorkspaceSnapshot({
+          modelItems: items,
+          reconciliation: [],
+          activeStep: 2,
+          uploadMeta: nextUploadMeta
+        });
       },
       {
         successMessage: `Model data imported from ${file.name}.`,
@@ -442,14 +575,10 @@ export default function App() {
   }
 
   async function handleSaveLegend() {
-    if (!projectId) {
-      return;
-    }
     await runTask(
-      "Saving legend",
+      "Saving legend locally",
       async () => {
-        const bundle = await saveLegend(projectId, legendSymbols);
-        applyBundle(bundle);
+        persistWorkspaceSnapshot({ legendSymbols });
       },
       {
         successMessage: "Legend saved successfully.",
@@ -459,14 +588,15 @@ export default function App() {
   }
 
   async function handleSaveDrawing() {
-    if (!projectId) {
-      return;
-    }
     await runTask(
-      "Saving drawing items",
+      "Saving drawing items locally",
       async () => {
-        const bundle = await saveDrawingItems(projectId, drawingItems);
-        applyBundle(bundle);
+        const nextProgress = buildProgressSnapshot(drawingItems, progress.learningSessions, progress.history);
+        setProgress(nextProgress);
+        persistWorkspaceSnapshot({
+          drawingItems,
+          progress: nextProgress
+        });
       },
       {
         successMessage: "Drawing MTO saved successfully.",
@@ -476,15 +606,16 @@ export default function App() {
   }
 
   async function handleRunReconciliation() {
-    if (!projectId) {
-      return;
-    }
     await runTask(
       "Running reconciliation",
       async () => {
-        const bundle = await runReconciliation(projectId);
-        applyBundle(bundle);
+        const results = reconcileRows(projectId, drawingItems, modelItems);
+        setReconciliation(results);
         setActiveStep(3);
+        persistWorkspaceSnapshot({
+          reconciliation: results,
+          activeStep: 3
+        });
       },
       {
         successMessage: "Reconciliation completed.",
@@ -494,22 +625,37 @@ export default function App() {
   }
 
   async function handleTrainAi() {
-    if (!projectId) {
+    const corrections = buildFeedback(drawingItems);
+    if (corrections.length === 0) {
+      setError("Review at least one drawing row before training the AI.");
+      showToast("error", "Review at least one drawing row before training the AI.");
       return;
     }
     await runTask(
       "Refreshing knowledge base",
       async () => {
-        const nextProgress = await submitFeedback(projectId, buildFeedback(drawingItems));
+        const response = await submitTrainingFeedback(corrections, {
+          projectName,
+          legendSymbolsCount: legendSymbols.length,
+          drawingItemsCount: drawingItems.length,
+          modelItemsCount: modelItems.length,
+          currentAccuracy: buildProgressSnapshot(drawingItems, progress.learningSessions, progress.history).currentAccuracy
+        });
+        setTrainingBenchmark(response.benchmark);
+        setTrainingKnowledge(response.knowledge);
+        setTrainingSessions(Array.isArray(response.sessions) ? response.sessions : []);
+        const nextLearningSessions = progress.learningSessions + 1;
+        const baseProgress = buildProgressSnapshot(drawingItems, nextLearningSessions, progress.history);
+        const nextProgress = {
+          ...baseProgress,
+          history: appendProgressHistory(baseProgress.history, nextLearningSessions, baseProgress.currentAccuracy)
+        };
         setProgress(nextProgress);
-        const cachedBundle = readJson<ProjectBundle>(PROJECT_CACHE_KEY);
-        if (cachedBundle) {
-          persistProjectBundle({
-            ...cachedBundle,
-            progress: nextProgress
-          });
-        }
         setActiveStep(4);
+        persistWorkspaceSnapshot({
+          progress: nextProgress,
+          activeStep: 4
+        });
       },
       {
         successMessage: "AI feedback applied successfully.",
@@ -519,13 +665,15 @@ export default function App() {
   }
 
   async function handleDownloadExport() {
-    if (!projectId) {
+    if (reconciliation.length === 0) {
+      setError("Run reconciliation before exporting.");
+      showToast("error", "Run reconciliation before exporting.");
       return;
     }
     await runTask(
       "Preparing export",
       async () => {
-        await downloadExport(projectId);
+        downloadReconciliationWorkbook(projectName, reconciliation);
       },
       {
         successMessage: "Export downloaded successfully.",
@@ -579,6 +727,11 @@ export default function App() {
                 </div>
               ) : null}
               {sessionUser ? (
+                <button className="reset-button reset-button-danger" onClick={handleClearAllData} type="button">
+                  CLEAR ALL DATA
+                </button>
+              ) : null}
+              {sessionUser ? (
                 <button className="reset-button" onClick={handleLogout} type="button">
                   SIGN OUT
                 </button>
@@ -599,7 +752,13 @@ export default function App() {
 
             {sessionUser ? (
               <>
-                <StepTabs activeStep={activeStep} onChange={setActiveStep} />
+                <StepTabs
+                  activeStep={activeStep}
+                  onChange={(step) => {
+                    setActiveStep(step);
+                    patchStoredWorkspaceSnapshot({ activeStep: step });
+                  }}
+                />
 
                 {activeStep === 0 ? (
                   <LegendStep symbols={legendSymbols} onChange={setLegendSymbols} onSave={handleSaveLegend} onUpload={handleLegendUpload} />
@@ -609,7 +768,10 @@ export default function App() {
                   <DrawingStep
                     onExport={handleDownloadExport}
                     items={drawingItems}
-                    onChange={setDrawingItems}
+                    onChange={(items) => {
+                      setDrawingItems(items);
+                      setProgress(buildProgressSnapshot(items, progress.learningSessions, progress.history));
+                    }}
                     onSave={handleSaveDrawing}
                     onTrain={handleTrainAi}
                     onUpload={handleDrawingUpload}
@@ -629,7 +791,8 @@ export default function App() {
                 {activeStep === 4 ? (
                   <AiProgressStep
                     drawingItems={drawingItems}
-                    onTrain={handleTrainAi}
+                    benchmark={trainingBenchmark}
+                    sessions={trainingSessions}
                     progress={progress}
                   />
                 ) : null}
@@ -695,6 +858,14 @@ function LegendStep({
         {symbols.length === 0 ? <div className="empty-state">No legend symbols extracted yet.</div> : null}
         {symbols.map((symbol, index) => (
           <article className="symbol-tile" key={symbol.id || `${symbol.name}-${index}`}>
+            <button
+              aria-label={`Remove ${symbol.name}`}
+              className="symbol-remove"
+              onClick={() => onChange(removeSymbol(symbols, index))}
+              type="button"
+            >
+              <X size={14} strokeWidth={2.4} />
+            </button>
             <div className="symbol-preview">
               {symbol.previewUrl ? (
                 <img alt={symbol.name} className="symbol-preview-image" src={symbol.previewUrl} />
@@ -722,6 +893,20 @@ function LegendStep({
       <div className="actions-row">
         <button className="cta-button" onClick={() => onChange([...symbols, blankLegend()])} type="button">
           ADD SYMBOL
+        </button>
+        <button
+          className="cta-button danger"
+          onClick={() => {
+            if (symbols.length === 0) {
+              return;
+            }
+            if (window.confirm("Clear all recognized symbols?")) {
+              onChange([]);
+            }
+          }}
+          type="button"
+        >
+          CLEAR ALL
         </button>
         <button className="cta-button green" onClick={onSave} type="button">
           SAVE LEGEND
@@ -955,35 +1140,36 @@ function ReconciliationStep({
 }
 
 function AiProgressStep({
+  benchmark,
   drawingItems,
-  onTrain,
+  sessions,
   progress
 }: {
+  benchmark: TrainingBenchmark;
   drawingItems: DrawingMtoItem[];
-  onTrain: () => Promise<void>;
+  sessions: TrainingSessionSummary[];
   progress: AiProgressSnapshot;
 }) {
+  const safeSessions = Array.isArray(sessions) ? sessions : [];
+  const displayed = benchmark.reviewedRows > 0 ? benchmark : progress;
   return (
     <div className="page-stack">
       <div className="summary-row">
-        <StatCard accent="mint" label="CURRENT ACCURACY" value={`${progress.currentAccuracy}%`} />
-        <StatCard accent="lavender" label="LEARNING SESSIONS" value={`${progress.learningSessions}`} />
-        <StatCard accent="amber" label="ERRORS CORRECTED" value={`${progress.errorsCorrected}`} />
-        <StatCard accent="lavenderStrong" label="RELIABILITY INDEX" value={progress.reliabilityIndex} />
+        <StatCard accent="mint" label="GLOBAL ACCURACY" value={`${displayed.currentAccuracy}%`} />
+        <StatCard accent="lavender" label="TRAINING SESSIONS" value={`${displayed.learningSessions}`} />
+        <StatCard accent="amber" label="CORRECTIONS LEARNED" value={`${displayed.errorsCorrected}`} />
+        <StatCard accent="lavenderStrong" label="RELIABILITY INDEX" value={displayed.reliabilityIndex} />
       </div>
 
       <div className="progress-grid">
-        <ProgressChart history={progress.history} />
+        <ProgressChart sessions={safeSessions} />
         <aside className="focus-card">
-          <h3>CURRENT AI FOCUS</h3>
+          <h3>GLOBAL AI BENCHMARK</h3>
           <ul>
-            <li>Refining Boundary Detection</li>
-            <li>Trace Logic Upstream Inference</li>
-            <li>Taper Detection Optimization</li>
+            <li>{benchmark.contributors} contributing account(s)</li>
+            <li>{displayed.reviewedRows} reviewed training samples</li>
+            <li>{benchmark.totalCorrections} total corrections learned</li>
           </ul>
-          <button className="cta-button" onClick={onTrain} type="button">
-            REFRESH KNOWLEDGE BASE
-          </button>
           <div className="mini-list">
             {drawingItems.slice(0, 3).map((item) => (
               <div className="mini-row" key={item.id}>
@@ -994,6 +1180,28 @@ function AiProgressStep({
           </div>
         </aside>
       </div>
+
+      <section className="table-card">
+        <div className="table-card-header">
+          <div className="table-heading">TRAINING SESSIONS</div>
+          <div className="chip-row">
+            <span className="filter-chip active">GLOBAL</span>
+            <span className="filter-chip">{safeSessions.length} SESSIONS</span>
+          </div>
+        </div>
+        <SimpleTable
+          columns={["SESSION", "TRAINED BY", "PROJECT", "ACCURACY", "CORRECTIONS", "TIME"]}
+          rows={safeSessions.map((session, index) => [
+            `S${safeSessions.length - index}`,
+            session.email || "Unknown account",
+            session.projectName || "HVAC AI Engineer MTO",
+            `${session.currentAccuracy}%`,
+            `${session.totalCorrections} (${session.approvedCount} approved / ${session.correctedCount} corrected)`,
+            formatSessionTime(session.createdAt)
+          ])}
+          emptyMessage="No training sessions recorded yet."
+        />
+      </section>
     </div>
   );
 }
@@ -1007,7 +1215,7 @@ function DrawingTable({
 }) {
   return (
     <SimpleTable
-      columns={["VERIFY", "TYPE", "DESCRIPTION", "SIZE", "ROOM", "TAG", "QTY"]}
+      columns={["VERIFY", "AI SOURCE", "TYPE", "DESCRIPTION", "SIZE", "ROOM", "TAG", "QTY"]}
       rows={
         items.length === 0
           ? []
@@ -1017,6 +1225,7 @@ function DrawingTable({
                 key={`${item.id}-verify`}
                 onChange={(status) => onChange(updateItem(items, index, "verificationStatus", status))}
               />,
+              <PredictionBadge item={item} key={`${item.id}-prediction`} />,
               <TypeBadge key={`${item.id}-type`} type={item.type} />,
               <input
                 className="table-input long"
@@ -1053,6 +1262,23 @@ function DrawingTable({
       }
       emptyMessage="No drawing items extracted yet."
     />
+  );
+}
+
+function PredictionBadge({ item }: { item: DrawingMtoItem }) {
+  const source = item.predictionSource ?? "heuristic";
+  const label =
+    source === "learned_exact_tag"
+      ? "LEARNED TAG"
+      : source === "learned_tag_family"
+        ? "LEARNED PATTERN"
+        : "HEURISTIC";
+
+  return (
+    <div className="prediction-cell" title={item.predictionDetail || undefined}>
+      <span className={`prediction-chip ${source}`}>{label}</span>
+      <span className="prediction-confidence">{Math.round(item.confidence * 100)}%</span>
+    </div>
   );
 }
 
@@ -1196,8 +1422,26 @@ function secondLine(value: string) {
   return value.split("|").slice(1).join(" | ").trim();
 }
 
+function formatSessionTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
 function updateSymbol(symbols: LegendSymbol[], index: number, key: keyof LegendSymbol, value: string) {
   return symbols.map((symbol, symbolIndex) => (symbolIndex === index ? { ...symbol, [key]: value } : symbol));
+}
+
+function removeSymbol(symbols: LegendSymbol[], index: number) {
+  return symbols.filter((_, symbolIndex) => symbolIndex !== index);
 }
 
 function blankLegend(): LegendSymbol {

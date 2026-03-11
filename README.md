@@ -2,13 +2,19 @@
 
 Cloudflare-first MVP for HVAC drawing legend extraction, drawing MTO capture, 3D model import, reconciliation, and feedback-driven AI progress tracking.
 
+The app is now local-first:
+
+- workflow data is stored in the browser with `localStorage`
+- uploaded files are parsed in-browser and are not persisted after a full clear or on a new device
+- the backend is used for Google authentication and AI training feedback only
+
 ## What This App Uses
 
 - `apps/web`: React + Vite frontend
 - `apps/api`: Hono API running on Cloudflare Workers
 - `packages/shared`: shared types and extraction/reconciliation logic
-- `D1`: relational database
-- `R2`: file storage for uploads
+- `D1`: relational database for auth-linked training feedback
+- `R2`: optional file storage routes still exist, but the main workflow no longer depends on remote uploads
 
 ## Before You Start
 
@@ -122,7 +128,8 @@ Do this after the app opens:
 3. Upload the drawing PDF.
 4. Upload the model XLS/XLSX/CSV.
 5. Run reconciliation.
-6. Refresh the page and confirm the session/workspace restores.
+6. Refresh the page and confirm the session/workspace restores from browser storage.
+7. Use `CLEAR ALL DATA` in the header to wipe the local workspace and sign out.
 
 ## Step 4: Prepare Cloudflare for Production
 
